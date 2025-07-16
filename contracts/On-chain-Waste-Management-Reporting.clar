@@ -3,8 +3,11 @@
 (define-constant err-not-found (err u101))
 (define-constant err-invalid-status (err u102))
 (define-constant err-already-exists (err u103))
+(define-constant err-insufficient-tokens (err u108))
+(define-constant err-token-transfer-failed (err u109))
 
 (define-data-var next-report-id uint u1)
+(define-data-var total-tokens-issued uint u0)
 
 (define-map reports
     uint
@@ -39,6 +42,14 @@
     }
 )
 
+(define-map token-balances
+    principal
+    {
+        balance: uint,
+        total-earned: uint,
+    }
+)
+
 (define-read-only (get-report (report-id uint))
     (map-get? reports report-id)
 )
@@ -55,6 +66,15 @@
 
 (define-read-only (get-cleanup-crew (crew principal))
     (map-get? cleanup-crews crew)
+)
+
+(define-read-only (get-token-balance (user principal))
+    (default-to {
+        balance: u0,
+        total-earned: u0,
+    }
+        (map-get? token-balances user)
+    )
 )
 
 (define-public (submit-report
@@ -118,6 +138,7 @@
     (let (
             (report (unwrap! (get-report report-id) err-not-found))
             (crew-stat (unwrap! (get-cleanup-crew tx-sender) (err u106)))
+            (reward-amount (calculate-reward-amount (get severity report)))
         )
         (asserts! (is-eq (some tx-sender) (get cleanup-assigned report))
             (err u107)
@@ -131,6 +152,7 @@
         (map-set cleanup-crews tx-sender
             (merge crew-stat { total-cleanups: (+ (get total-cleanups crew-stat) u1) })
         )
+        (unwrap-panic (award-tokens tx-sender reward-amount))
         (ok true)
     )
 )
@@ -149,4 +171,60 @@
         (end uint)
     )
     (map get-report (list start end))
+)
+
+(define-private (calculate-reward-amount (severity uint))
+    (if (is-eq severity u5)
+        u100
+        (if (is-eq severity u4)
+            u75
+            (if (is-eq severity u3)
+                u50
+                (if (is-eq severity u2)
+                    u25
+                    u10
+                )
+            )
+        )
+    )
+)
+
+(define-private (award-tokens
+        (recipient principal)
+        (amount uint)
+    )
+    (let (
+            (current-balance (get-token-balance recipient))
+            (current-total-supply (var-get total-tokens-issued))
+        )
+        (map-set token-balances recipient
+            (merge current-balance {
+                balance: (+ (get balance current-balance) amount),
+                total-earned: (+ (get total-earned current-balance) amount),
+            })
+        )
+        (var-set total-tokens-issued (+ current-total-supply amount))
+        (ok true)
+    )
+)
+
+(define-public (transfer-tokens
+        (recipient principal)
+        (amount uint)
+    )
+    (let (
+            (sender-balance (get-token-balance tx-sender))
+            (recipient-balance (get-token-balance recipient))
+        )
+        (asserts! (>= (get balance sender-balance) amount)
+            err-insufficient-tokens
+        )
+        (map-set token-balances tx-sender
+            (merge sender-balance { balance: (- (get balance sender-balance) amount) })
+        )
+        (map-set token-balances recipient
+            (merge recipient-balance { balance: (+ (get balance recipient-balance) amount) })
+        )
+        (ok true)
+    )
 )
