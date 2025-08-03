@@ -5,6 +5,10 @@
 (define-constant err-already-exists (err u103))
 (define-constant err-insufficient-tokens (err u108))
 (define-constant err-token-transfer-failed (err u109))
+(define-constant err-penalty-already-applied (err u110))
+
+(define-constant penalty-threshold-blocks u144)
+(define-constant base-penalty-amount u5)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-tokens-issued uint u0)
@@ -21,6 +25,7 @@
         timestamp: uint,
         cleanup-assigned: (optional principal),
         cleanup-completed: bool,
+        penalty-applied: bool,
     }
 )
 
@@ -114,6 +119,7 @@
         timestamp: stacks-block-height,
         cleanup-assigned: none,
         cleanup-completed: false,
+        penalty-applied: false,
     })
 )
 
@@ -226,5 +232,62 @@
             (merge recipient-balance { balance: (+ (get balance recipient-balance) amount) })
         )
         (ok true)
+    )
+)
+
+(define-private (calculate-penalty
+        (report-age uint)
+        (severity uint)
+    )
+    (let (
+            (severity-multiplier (if (>= severity u4)
+                u2
+                u1
+            ))
+            (age-multiplier (/ report-age penalty-threshold-blocks))
+        )
+        (* base-penalty-amount severity-multiplier age-multiplier)
+    )
+)
+
+(define-public (apply-penalty-for-delayed-verification (report-id uint))
+    (let (
+            (report (unwrap! (get-report report-id) err-not-found))
+            (report-age (- stacks-block-height (get timestamp report)))
+            (penalty-amount (calculate-penalty report-age (get severity report)))
+        )
+        (asserts! (>= report-age penalty-threshold-blocks) (err u111))
+        (asserts! (is-eq false (get penalty-applied report))
+            err-penalty-already-applied
+        )
+        (asserts! (is-eq false (get cleanup-completed report)) (err u112))
+
+        (map-set reports report-id (merge report { penalty-applied: true }))
+
+        (match (get cleanup-assigned report)
+            assigned-crew (unwrap-panic (deduct-tokens assigned-crew penalty-amount))
+            true
+        )
+        (ok penalty-amount)
+    )
+)
+
+(define-private (deduct-tokens
+        (user principal)
+        (amount uint)
+    )
+    (let ((current-balance (get-token-balance user)))
+        (if (>= (get balance current-balance) amount)
+            (begin
+                (map-set token-balances user
+                    (merge current-balance { balance: (- (get balance current-balance) amount) })
+                )
+                (var-set total-tokens-issued
+                    (- (var-get total-tokens-issued) amount)
+                )
+                (ok true)
+            )
+            (ok true)
+        )
     )
 )
