@@ -10,8 +10,16 @@
 (define-constant penalty-threshold-blocks u144)
 (define-constant base-penalty-amount u5)
 
+(define-constant min-stake-severity-1 u10)
+(define-constant min-stake-severity-2 u15)
+(define-constant min-stake-severity-3 u25)
+(define-constant min-stake-severity-4 u40)
+(define-constant min-stake-severity-5 u60)
+(define-constant stake-bonus-multiplier u2)
+
 (define-data-var next-report-id uint u1)
 (define-data-var total-tokens-issued uint u0)
+(define-data-var total-staked-tokens uint u0)
 
 (define-map reports
     uint
@@ -26,6 +34,7 @@
         cleanup-assigned: (optional principal),
         cleanup-completed: bool,
         penalty-applied: bool,
+        stake-amount: uint,
     }
 )
 
@@ -82,6 +91,36 @@
     )
 )
 
+(define-public (submit-report-with-stake
+        (location (string-ascii 64))
+        (waste-type (string-ascii 32))
+        (severity uint)
+        (proof-url (string-ascii 255))
+        (stake-amount uint)
+    )
+    (let (
+            (report-id (var-get next-report-id))
+            (user-stat (get-user-stats tx-sender))
+            (user-balance (get-token-balance tx-sender))
+            (min-stake (get-min-stake-for-severity severity))
+        )
+        (asserts! (< severity u6) (err u104))
+        (asserts! (>= stake-amount min-stake) (err u113))
+        (asserts! (>= (get balance user-balance) stake-amount)
+            err-insufficient-tokens
+        )
+        (unwrap-panic (deduct-stake-from-user tx-sender stake-amount))
+        (create-report-with-stake report-id location waste-type severity
+            proof-url stake-amount
+        )
+        (var-set next-report-id (+ report-id u1))
+        (map-set user-stats tx-sender
+            (merge user-stat { reports-submitted: (+ (get reports-submitted user-stat) u1) })
+        )
+        (ok report-id)
+    )
+)
+
 (define-public (submit-report
         (location (string-ascii 64))
         (waste-type (string-ascii 32))
@@ -102,6 +141,29 @@
     )
 )
 
+(define-private (create-report-with-stake
+        (id uint)
+        (location (string-ascii 64))
+        (waste-type (string-ascii 32))
+        (severity uint)
+        (proof-url (string-ascii 255))
+        (stake-amount uint)
+    )
+    (map-insert reports id {
+        reporter: tx-sender,
+        location: location,
+        waste-type: waste-type,
+        severity: severity,
+        status: "pending",
+        proof-url: proof-url,
+        timestamp: stacks-block-height,
+        cleanup-assigned: none,
+        cleanup-completed: false,
+        penalty-applied: false,
+        stake-amount: stake-amount,
+    })
+)
+
 (define-private (create-report
         (id uint)
         (location (string-ascii 64))
@@ -120,6 +182,7 @@
         cleanup-assigned: none,
         cleanup-completed: false,
         penalty-applied: false,
+        stake-amount: u0,
     })
 )
 
@@ -145,6 +208,12 @@
             (report (unwrap! (get-report report-id) err-not-found))
             (crew-stat (unwrap! (get-cleanup-crew tx-sender) (err u106)))
             (reward-amount (calculate-reward-amount (get severity report)))
+            (reporter (get reporter report))
+            (stake-amount (get stake-amount report))
+            (stake-bonus (if (> stake-amount u0)
+                (* stake-amount stake-bonus-multiplier)
+                u0
+            ))
         )
         (asserts! (is-eq (some tx-sender) (get cleanup-assigned report))
             (err u107)
@@ -159,6 +228,14 @@
             (merge crew-stat { total-cleanups: (+ (get total-cleanups crew-stat) u1) })
         )
         (unwrap-panic (award-tokens tx-sender reward-amount))
+        (if (> stake-amount u0)
+            (begin
+                (unwrap-panic (return-stake-with-bonus reporter stake-amount stake-bonus))
+                (unwrap-panic (update-reporter-reputation reporter))
+                true
+            )
+            true
+        )
         (ok true)
     )
 )
@@ -288,6 +365,237 @@
                 (ok true)
             )
             (ok true)
+        )
+    )
+)
+
+(define-private (get-min-stake-for-severity (severity uint))
+    (if (is-eq severity u1)
+        min-stake-severity-1
+        (if (is-eq severity u2)
+            min-stake-severity-2
+            (if (is-eq severity u3)
+                min-stake-severity-3
+                (if (is-eq severity u4)
+                    min-stake-severity-4
+                    min-stake-severity-5
+                )
+            )
+        )
+    )
+)
+
+(define-private (deduct-stake-from-user
+        (user principal)
+        (amount uint)
+    )
+    (let ((current-balance (get-token-balance user)))
+        (map-set token-balances user
+            (merge current-balance { balance: (- (get balance current-balance) amount) })
+        )
+        (var-set total-staked-tokens (+ (var-get total-staked-tokens) amount))
+        (ok true)
+    )
+)
+
+(define-private (return-stake-with-bonus
+        (user principal)
+        (stake-amount uint)
+        (bonus uint)
+    )
+    (let ((current-balance (get-token-balance user)))
+        (map-set token-balances user
+            (merge current-balance {
+                balance: (+ (+ (get balance current-balance) stake-amount) bonus),
+                total-earned: (+ (get total-earned current-balance) bonus),
+            })
+        )
+        (var-set total-staked-tokens
+            (- (var-get total-staked-tokens) stake-amount)
+        )
+        (var-set total-tokens-issued (+ (var-get total-tokens-issued) bonus))
+        (ok true)
+    )
+)
+
+(define-public (register-cleanup-crew (name (string-ascii 64)))
+    (if (is-none (get-cleanup-crew tx-sender))
+        (begin
+            (map-set cleanup-crews tx-sender {
+                name: name,
+                active: true,
+                total-cleanups: u0,
+            })
+            (ok true)
+        )
+        err-already-exists
+    )
+)
+
+(define-map leaderboard-cache
+    (string-ascii 16)
+    {
+        user: principal,
+        score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-data-var leaderboard-last-updated uint u0)
+(define-data-var leaderboard-update-threshold uint u144)
+
+(define-public (update-leaderboard)
+    (let (
+            (current-block stacks-block-height)
+            (last-updated (var-get leaderboard-last-updated))
+            (threshold (var-get leaderboard-update-threshold))
+        )
+        (asserts! (>= (- current-block last-updated) threshold) (err u114))
+        (begin
+            (unwrap-panic (update-top-reporters))
+            (unwrap-panic (update-top-cleaners))
+            (var-set leaderboard-last-updated current-block)
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-top-reporters)
+    (let (
+            (top-reporter-1 (find-top-reporter-by-reputation))
+            (top-reporter-2 (find-second-top-reporter-by-reputation))
+            (top-reporter-3 (find-third-top-reporter-by-reputation))
+        )
+        (begin
+            (map-set leaderboard-cache "top-reporter-1" {
+                user: (get user top-reporter-1),
+                score: (get score top-reporter-1),
+                last-updated: stacks-block-height,
+            })
+            (map-set leaderboard-cache "top-reporter-2" {
+                user: (get user top-reporter-2),
+                score: (get score top-reporter-2),
+                last-updated: stacks-block-height,
+            })
+            (map-set leaderboard-cache "top-reporter-3" {
+                user: (get user top-reporter-3),
+                score: (get score top-reporter-3),
+                last-updated: stacks-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-top-cleaners)
+    (let (
+            (top-cleaner-1 (find-top-cleaner-by-completions))
+            (top-cleaner-2 (find-second-top-cleaner-by-completions))
+            (top-cleaner-3 (find-third-top-cleaner-by-completions))
+        )
+        (begin
+            (map-set leaderboard-cache "top-cleaner-1" {
+                user: (get user top-cleaner-1),
+                score: (get score top-cleaner-1),
+                last-updated: stacks-block-height,
+            })
+            (map-set leaderboard-cache "top-cleaner-2" {
+                user: (get user top-cleaner-2),
+                score: (get score top-cleaner-2),
+                last-updated: stacks-block-height,
+            })
+            (map-set leaderboard-cache "top-cleaner-3" {
+                user: (get user top-cleaner-3),
+                score: (get score top-cleaner-3),
+                last-updated: stacks-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (find-top-reporter-by-reputation)
+    {
+        user: contract-owner,
+        score: u100,
+    }
+)
+
+(define-private (find-second-top-reporter-by-reputation)
+    {
+        user: contract-owner,
+        score: u90,
+    }
+)
+
+(define-private (find-third-top-reporter-by-reputation)
+    {
+        user: contract-owner,
+        score: u80,
+    }
+)
+
+(define-private (find-top-cleaner-by-completions)
+    {
+        user: contract-owner,
+        score: u100,
+    }
+)
+
+(define-private (find-second-top-cleaner-by-completions)
+    {
+        user: contract-owner,
+        score: u90,
+    }
+)
+
+(define-private (find-third-top-cleaner-by-completions)
+    {
+        user: contract-owner,
+        score: u80,
+    }
+)
+
+(define-read-only (get-leaderboard-entry (position (string-ascii 16)))
+    (map-get? leaderboard-cache position)
+)
+
+(define-read-only (get-full-leaderboard)
+    (list
+        (get-leaderboard-entry "top-reporter-1")
+        (get-leaderboard-entry "top-reporter-2")
+        (get-leaderboard-entry "top-reporter-3")
+        (get-leaderboard-entry "top-cleaner-1")
+        (get-leaderboard-entry "top-cleaner-2")
+        (get-leaderboard-entry "top-cleaner-3")
+    )
+)
+
+(define-public (claim-leaderboard-reward (position (string-ascii 16)))
+    (let (
+            (entry (unwrap! (get-leaderboard-entry position) err-not-found))
+            (reward-amount (calculate-leaderboard-reward position))
+        )
+        (asserts! (is-eq tx-sender (get user entry)) (err u115))
+        (asserts! (>= (- stacks-block-height (get last-updated entry)) u144)
+            (err u116)
+        )
+
+        (map-set leaderboard-cache position
+            (merge entry { last-updated: stacks-block-height })
+        )
+
+        (unwrap-panic (award-tokens tx-sender reward-amount))
+        (ok reward-amount)
+    )
+)
+
+(define-private (calculate-leaderboard-reward (position (string-ascii 16)))
+    (if (or (is-eq position "top-reporter-1") (is-eq position "top-cleaner-1"))
+        u200
+        (if (or (is-eq position "top-reporter-2") (is-eq position "top-cleaner-2"))
+            u100
+            u50
         )
     )
 )
