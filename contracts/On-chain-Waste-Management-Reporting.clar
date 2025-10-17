@@ -6,6 +6,11 @@
 (define-constant err-insufficient-tokens (err u108))
 (define-constant err-token-transfer-failed (err u109))
 (define-constant err-penalty-already-applied (err u110))
+(define-constant err-already-verified (err u117))
+(define-constant err-cannot-verify-own (err u118))
+(define-constant err-report-not-pending (err u119))
+(define-constant err-insufficient-verifications (err u120))
+(define-constant err-dispute-threshold-not-met (err u121))
 
 (define-constant penalty-threshold-blocks u144)
 (define-constant base-penalty-amount u5)
@@ -16,6 +21,10 @@
 (define-constant min-stake-severity-4 u40)
 (define-constant min-stake-severity-5 u60)
 (define-constant stake-bonus-multiplier u2)
+(define-constant min-verification-stake u5)
+(define-constant verification-reward u10)
+(define-constant dispute-threshold u3)
+(define-constant min-verifications-for-auto-approval u5)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-tokens-issued uint u0)
@@ -597,5 +606,261 @@
             u100
             u50
         )
+    )
+)
+
+(define-map report-verifications
+    {
+        report-id: uint,
+        verifier: principal,
+    }
+    {
+        stake-amount: uint,
+        verification-type: (string-ascii 16),
+        timestamp: uint,
+        rewarded: bool,
+    }
+)
+
+(define-map report-verification-stats
+    uint
+    {
+        total-verifications: uint,
+        total-disputes: uint,
+        verification-status: (string-ascii 16),
+        total-verification-stake: uint,
+        total-dispute-stake: uint,
+    }
+)
+
+(define-read-only (get-verification
+        (report-id uint)
+        (verifier principal)
+    )
+    (map-get? report-verifications {
+        report-id: report-id,
+        verifier: verifier,
+    })
+)
+
+(define-read-only (get-verification-stats (report-id uint))
+    (default-to {
+        total-verifications: u0,
+        total-disputes: u0,
+        verification-status: "unverified",
+        total-verification-stake: u0,
+        total-dispute-stake: u0,
+    }
+        (map-get? report-verification-stats report-id)
+    )
+)
+
+(define-public (verify-report
+        (report-id uint)
+        (stake-amount uint)
+    )
+    (let (
+            (report (unwrap! (get-report report-id) err-not-found))
+            (verifier-balance (get-token-balance tx-sender))
+            (existing-verification (get-verification report-id tx-sender))
+            (verification-stats (get-verification-stats report-id))
+        )
+        (asserts! (is-eq (get status report) "pending") err-report-not-pending)
+        (asserts! (not (is-eq tx-sender (get reporter report)))
+            err-cannot-verify-own
+        )
+        (asserts! (is-none existing-verification) err-already-verified)
+        (asserts! (>= stake-amount min-verification-stake) (err u122))
+        (asserts! (>= (get balance verifier-balance) stake-amount)
+            err-insufficient-tokens
+        )
+
+        (unwrap-panic (deduct-tokens-for-verification tx-sender stake-amount))
+
+        (map-set report-verifications {
+            report-id: report-id,
+            verifier: tx-sender,
+        } {
+            stake-amount: stake-amount,
+            verification-type: "support",
+            timestamp: stacks-block-height,
+            rewarded: false,
+        })
+
+        (map-set report-verification-stats report-id {
+            total-verifications: (+ (get total-verifications verification-stats) u1),
+            total-disputes: (get total-disputes verification-stats),
+            verification-status: (get verification-status verification-stats),
+            total-verification-stake: (+ (get total-verification-stake verification-stats) stake-amount),
+            total-dispute-stake: (get total-dispute-stake verification-stats),
+        })
+
+        (if (>= (+ (get total-verifications verification-stats) u1)
+                min-verifications-for-auto-approval
+            )
+            (begin
+                (map-set reports report-id (merge report { status: "verified" }))
+                (map-set report-verification-stats report-id
+                    (merge (get-verification-stats report-id) { verification-status: "verified" })
+                )
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (dispute-report
+        (report-id uint)
+        (stake-amount uint)
+    )
+    (let (
+            (report (unwrap! (get-report report-id) err-not-found))
+            (verifier-balance (get-token-balance tx-sender))
+            (existing-verification (get-verification report-id tx-sender))
+            (verification-stats (get-verification-stats report-id))
+        )
+        (asserts! (is-eq (get status report) "pending") err-report-not-pending)
+        (asserts! (not (is-eq tx-sender (get reporter report)))
+            err-cannot-verify-own
+        )
+        (asserts! (is-none existing-verification) err-already-verified)
+        (asserts! (>= stake-amount min-verification-stake) (err u122))
+        (asserts! (>= (get balance verifier-balance) stake-amount)
+            err-insufficient-tokens
+        )
+
+        (unwrap-panic (deduct-tokens-for-verification tx-sender stake-amount))
+
+        (map-set report-verifications {
+            report-id: report-id,
+            verifier: tx-sender,
+        } {
+            stake-amount: stake-amount,
+            verification-type: "dispute",
+            timestamp: stacks-block-height,
+            rewarded: false,
+        })
+
+        (map-set report-verification-stats report-id {
+            total-verifications: (get total-verifications verification-stats),
+            total-disputes: (+ (get total-disputes verification-stats) u1),
+            verification-status: (get verification-status verification-stats),
+            total-verification-stake: (get total-verification-stake verification-stats),
+            total-dispute-stake: (+ (get total-dispute-stake verification-stats) stake-amount),
+        })
+
+        (if (>= (+ (get total-disputes verification-stats) u1) dispute-threshold)
+            (begin
+                (map-set reports report-id (merge report { status: "disputed" }))
+                (map-set report-verification-stats report-id
+                    (merge (get-verification-stats report-id) { verification-status: "disputed" })
+                )
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-verification
+        (report-id uint)
+        (valid bool)
+    )
+    (let (
+            (report (unwrap! (get-report report-id) err-not-found))
+            (verification-stats (get-verification-stats report-id))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts!
+            (or
+                (is-eq (get verification-status verification-stats) "verified")
+                (is-eq (get verification-status verification-stats) "disputed")
+            )
+            (err u123)
+        )
+
+        (if valid
+            (begin
+                (map-set reports report-id (merge report { status: "verified" }))
+                (map-set report-verification-stats report-id
+                    (merge verification-stats { verification-status: "resolved-valid" })
+                )
+                (ok true)
+            )
+            (begin
+                (map-set reports report-id (merge report { status: "rejected" }))
+                (map-set report-verification-stats report-id
+                    (merge verification-stats { verification-status: "resolved-invalid" })
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (claim-verification-reward (report-id uint))
+    (let (
+            (verification (unwrap! (get-verification report-id tx-sender) err-not-found))
+            (verification-stats (get-verification-stats report-id))
+            (verification-type (get verification-type verification))
+        )
+        (asserts! (not (get rewarded verification)) (err u124))
+        (asserts!
+            (or
+                (is-eq (get verification-status verification-stats)
+                    "resolved-valid"
+                )
+                (is-eq (get verification-status verification-stats)
+                    "resolved-invalid"
+                )
+            )
+            (err u125)
+        )
+
+        (let (
+                (is-valid-resolution (is-eq (get verification-status verification-stats)
+                    "resolved-valid"
+                ))
+                (is-correct-verification (and
+                    (is-eq verification-type "support")
+                    is-valid-resolution
+                ))
+                (is-correct-dispute (and
+                    (is-eq verification-type "dispute")
+                    (not is-valid-resolution)
+                ))
+                (stake-amount (get stake-amount verification))
+                (reward-amount (if (or is-correct-verification is-correct-dispute)
+                    (+ stake-amount verification-reward)
+                    u0
+                ))
+            )
+            (map-set report-verifications {
+                report-id: report-id,
+                verifier: tx-sender,
+            }
+                (merge verification { rewarded: true })
+            )
+
+            (if (> reward-amount u0)
+                (unwrap-panic (award-tokens tx-sender reward-amount))
+                true
+            )
+
+            (ok reward-amount)
+        )
+    )
+)
+
+(define-private (deduct-tokens-for-verification
+        (user principal)
+        (amount uint)
+    )
+    (let ((current-balance (get-token-balance user)))
+        (map-set token-balances user
+            (merge current-balance { balance: (- (get balance current-balance) amount) })
+        )
+        (ok true)
     )
 )
