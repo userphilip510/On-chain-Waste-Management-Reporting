@@ -864,3 +864,45 @@
         (ok true)
     )
 )
+
+(define-constant wmr-feat1-err-already-exists (err u130))
+
+(define-map wmr-feat1-receipts
+    {
+        hash: (buff 32),
+    }
+    {
+        sender: principal,
+        height: uint,
+    }
+)
+
+(define-data-var wmr-feat1-count uint u0)
+
+(define-public (wmr-feat1-commit (hash (buff 32)))
+    (let ((existing (map-get? wmr-feat1-receipts { hash: hash })))
+        (if (is-some existing)
+            wmr-feat1-err-already-exists
+            (let ((new-count (+ (var-get wmr-feat1-count) u1)))
+                (map-set wmr-feat1-receipts { hash: hash } {
+                    sender: tx-sender,
+                    height: stacks-block-height,
+                })
+                (var-set wmr-feat1-count new-count)
+                (ok new-count)
+            )
+        )
+    )
+)
+
+(define-read-only (wmr-feat1-get (hash (buff 32)))
+    (map-get? wmr-feat1-receipts { hash: hash })
+)
+
+(define-read-only (wmr-feat1-is-committed (hash (buff 32)))
+    (is-some (map-get? wmr-feat1-receipts { hash: hash }))
+)
+
+(define-read-only (wmr-feat1-count-total)
+    (var-get wmr-feat1-count)
+)
